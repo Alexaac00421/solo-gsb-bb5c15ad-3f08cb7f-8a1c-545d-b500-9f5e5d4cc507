@@ -17,6 +17,13 @@
 周期封存（seal，v1.2）：
 - cycles.sealed_at / seal_fingerprint 记录封存状态与封存时核对的内容指纹；
 - 旧库升级时自动补列，旧周期一律默认未封存。
+
+现场采集包（packages，v1.8）：
+- 设备断网后批量补传"登记信息 + 时钟周期 + 同步锚点 + 声段"，包编号全局唯一；
+- content_hash 为规范记录集合的 sha256：同编号同集合重放、编号复用内容不同拒绝；
+- result_json 保存首次导入结果，整包业务行与包行在同一写事务内提交（BEGIN
+  IMMEDIATE），与版本发布共用写锁，读侧永远观察不到半包状态。
+- packages 为全新表（CREATE TABLE IF NOT EXISTS），无旧库迁移负担。
 """
 from __future__ import annotations
 
@@ -95,6 +102,16 @@ CREATE TABLE IF NOT EXISTS version_segments (
     utc_end_ms      INTEGER,
     created_at      TEXT,
     PRIMARY KEY (version_no, capture_id)
+);
+
+-- v1.8 现场断网采集包：package_id 全局唯一，内容指纹（规范记录集合的 sha256）
+-- 用于"同编号同记录集合重放、编号复用内容不同整包拒绝"；result_json 保存首次
+-- 导入结果，重传原样返回。所有业务行与本行在同一写事务内提交，不存在半包状态。
+CREATE TABLE IF NOT EXISTS packages (
+    package_id   TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    result_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL
 );
 """
 

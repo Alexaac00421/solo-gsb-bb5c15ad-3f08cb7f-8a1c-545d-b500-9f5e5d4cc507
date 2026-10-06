@@ -11,6 +11,7 @@
 - **回放裁剪（playback clip，v1.5 新增）**：现场复核人员按 UTC 毫秒半开窗口裁出**可交给录音设备回放的片段**——每条与窗口相交且可定位的声段返回本地裁剪起止与映射后的 UTC 起止，本地边界取该声段本地范围内"映射 UTC 首次不小于窗口对应边界"的整数毫秒（不存在则截在声段末端），裁后起止相同的声段不返回；可查询**当前时间轴**或**指定已发布版本**（只用发布时冻结的锚点与声段，旧版快照缺失的周期归属按 default 处理）；同设备重叠声段分别返回，按 UTC 起点、设备编号、采集编号排序；纯只读接口，无效输入或版本不存在明确拒绝且不改动数据。
 - **现场时钟漂移审计（drift audit，v1.6 新增）**：现场校准后，运维人员提交**设备编号、周期编号、非负最大时钟漂移 ppm**（可选已发布版本号）；服务读取该周期**当前锚点**或**指定版本冻结锚点**（旧版快照缺失周期归属按 default 处理），按本地时间**相邻配对**，逐段计算 UTC/本地速率与（有符号）漂移 ppm，标出 `|漂移|` 超过阈值的区间，并给出**首尾锚点、本地/UTC 区间跨度、异常原因与偏快/偏慢方向**；锚点少于两个（`400 insufficient_anchors`）、阈值非法（`400 invalid_threshold`）、设备/周期/版本不存在（`404`）均明确拒绝、**不改动任何数据**；纯只读接口，封存周期同样可审计。
 - **锚点更正覆盖预演（coverage rehearsal，v1.7 新增）**：现场人员在**实际更正某设备周期锚点之前**，先预演指定 UTC 半开时段的录音覆盖会否恶化。提交设备/周期、**周期详情中的内容指纹**、**拟整体替换的非空锚点列表**、时段起止与最少设备数；服务在**同一当前快照**内，按现有周期映射与毫秒取整规则分别计算**更正前**与**假设更正后**的覆盖（其他周期与设备保持当前值），返回两侧覆盖结论（片段/连续缺口/统计）以及**原先达标而预演后不达标的各个连续区间**（含两侧设备并集与峰值设备数）。同设备重叠声段只算一台、不可定位声段不计；指纹过期（`409 rehearsal_fingerprint_stale`）、周期已封存（`409 cycle_sealed`）、锚点不严格递增（`400 anchors_not_increasing`）、时间或门槛非法（`400`）、设备或周期不存在（`404`）一律明确拒绝。**预演纯只读**：不写入、不影响当前时间轴或任何已发布版本。
+- **现场断网采集包整包导入（packages，v1.8 新增）**：设备断网后，将多台设备的**登记信息、时钟周期、同步锚点、声段**汇成一个带 `package_id` 的采集包，恢复网络后通过 `POST /packages` 一次性补传。包内四类记录**顺序不限**，声段/锚点可**前向引用同包登记**的设备与周期；每周期按"库内现存 + 包内新增"的**最终锚点序列**校验严格递增，锚点乱序提交由服务排序后检查，**不因上传顺序误拒**。相同包编号的**相同记录集合重传**（网络重试，允许乱序与夹带完全相同的重复项）返回 `200` 与**首次结果**且不重复写入；**编号复用但内容不同**（`409 package_conflict`）、同标识记录与库中冲突（`409 device_conflict`/`cycle_conflict`/`anchor_conflict`/`capture_conflict`）、**引用缺失**（`404 package_reference_missing`）、**锚点序列非法**（`400 anchors_not_increasing`）、**试图变更封存周期**（`409 cycle_sealed`）均**整包拒绝、不留下部分数据**。成功返回各类记录的新增/复用数量与包内声段当前定位；当前时间轴反映入库结果，**已发布版本仍是原快照**；导入与单条录入、封存、发布共用同一写锁（`BEGIN IMMEDIATE`），**并发导入与发布都观察不到半包状态**。
 
 ## 快速开始
 
@@ -248,6 +249,52 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 }
 ```
 
+### 现场断网采集包（packages，v1.8）
+
+设备在现场断网期间无法逐条调用 API，恢复网络后把多台设备的**登记信息（devices）、时钟周期（cycles）、同步锚点（anchors）、声段（segments）**汇成一个带 `package_id` 的采集包一次性补传：`POST /packages`。
+
+- **请求体**：`{"package_id", "devices?": [...], "cycles?": [...], "anchors?": [...], "segments?": [...]}`；四段均可缺省但至少含一段。记录字段与既有单条接口完全一致（`name`/`note` 可省、锚点与声段省略 `cycle_id` 归入 `default`），字段规则（ID 命名、int64 毫秒、声段不倒置等）原样适用。
+- **顺序不限、可前向引用**：段的先后顺序与段内记录顺序都没有要求——声段可以出现在设备登记之前，锚点可以引用同包稍后才出现的周期；新设备登记时同样隐式创建 `default` 周期（包内显式提交该设备 `default` 周期时 note 必须为空，否则 `409 cycle_conflict`）。
+- **按最终锚点序列校验**：每周期把**库内现存锚点与包内锚点合并去重**后，再按 `local_ms` 排序检查本地唯一、UTC 严格递增；包内乱序提交会先排序，只拒绝真正破坏单调序列的包（`400 anchors_not_increasing`，响应附设备/周期与冲突点）。
+- **新增与复用**：同标识且同内容的已存记录计为**复用**（不写入）——设备同 `name`、周期同 `note`、锚点同 `(设备, 周期, local_ms, utc_ms)`、声段按既有内容指纹（含周期）一致；异内容分别报 `409 device_conflict` / `cycle_conflict` / `anchor_conflict` / `capture_conflict`（声段复用既有错误码，响应附已存与本次内容）。包内同标识异内容同样整包拒绝。
+- **引用缺失**：锚点/声段引用的设备、周期在库中与同包登记中都不存在 → `404 package_reference_missing`，`details.missing` 逐项列出（区分缺设备/缺周期）。
+- **封存保护**：向已封存周期**新增**锚点/声段 → `409 cycle_sealed`；同内容锚点/声段重传属于既有幂等/复用，不改变封存内容，允许通过。
+- **整包原子**：全部"校验 + 写入 + 包记录落盘"在单个 `BEGIN IMMEDIATE` 事务内完成，任一错误立即回滚，**不留下部分数据**（已验证：失败包引用的新设备也不会落库）；与单条录入、周期封存、版本发布共用写锁，**并发导入与发布永远观察不到半包状态**——每个已发布版本中，同一包的声段要么全部出现、要么全部缺席。
+- **幂等重传**：服务对"去重并排序后的规范记录集合"计算内容指纹。相同 `package_id` + 相同集合（重试时 JSON 顺序变化、夹带完全相同的重复项均视为同一集合）→ `200`，返回体与首次完全一致（`idempotent_replay: true`、`created_at` 与计数均为首次值），**不重复写入**；相同 `package_id` + 不同集合 → `409 package_conflict`（响应附双方指纹）。
+- **成功响应（201）**：`counts` 给出四类记录各自的 `added` / `reused`（`cycles.added` 含新设备隐式创建的 `default` 周期），`segments` 为包内全部声段按入库后锚点计算的当前定位（沿用既有排序与 `unlocatable` 规则——锚点覆盖不足不阻塞入库），`content_hash` 为记录集合指纹。
+- **当前时间轴与版本**：导入成功即反映在 `GET /timeline/current`；**已发布版本保持原快照不变**，之后 `POST /versions` 的新版本才包含新增声段（`changes.added` 体现）。`GET /packages` 列出已接收采集包，`GET /packages/{package_id}` 返回首次导入的完整结果。
+- **与既有规则共存**：单条录入、周期封存、锚点更正、版本发布的调用与结果完全不受影响；采集包只是把它们组合成一个顺序无关、可安全重试的原子批量入口。
+
+请求示例（现场两台设备一个断网周期，记录故意乱序）：
+
+```bash
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' -d '{
+  "package_id":"FIELD-20261006-01",
+  "segments":[
+    {"capture_id":"FIELD-CAP-A","device_id":"FIELD-D1","cycle_id":"boot-2",
+     "local_start_ms":1000,"local_end_ms":61000,"note":"黎明鸟鸣"},
+    {"capture_id":"FIELD-CAP-B","device_id":"FIELD-D2",
+     "local_start_ms":1000,"local_end_ms":20000}
+  ],
+  "anchors":[
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":61000,"utc_ms":1700010060500},
+    {"device_id":"FIELD-D2","local_ms":1000,"utc_ms":1700000001000},
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":1000,"utc_ms":1700010000000},
+    {"device_id":"FIELD-D2","local_ms":20000,"utc_ms":1700000020000}
+  ],
+  "cycles":[{"device_id":"FIELD-D1","cycle_id":"boot-2","note":"第二次开机"}],
+  "devices":[{"device_id":"FIELD-D1","name":"现场录音笔-甲"},
+             {"device_id":"FIELD-D2","name":"现场录音笔-乙"}]
+}'
+# => 201 {"package_id":"FIELD-20261006-01","idempotent_replay":false,
+#         "counts":{"devices":{"added":2,"reused":0},
+#                   "cycles":{"added":3,"reused":0},      # 2 个隐式 default + 1 个 boot-2
+#                   "anchors":{"added":4,"reused":0},
+#                   "segments":{"added":2,"reused":0}},
+#         "segments":[...按入库后锚点定位，located/unlocatable 与排序沿用既有规则...],
+#         "content_hash":"85591238..."}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -297,6 +344,11 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 更正预演：周期已封存 | `409 cycle_sealed` |
 | 更正预演：时间/区间/门槛非法 | `400 invalid_time` / `400 invalid_range` / `400 invalid_threshold` |
 | 更正预演：设备/周期不存在 | `404 device_not_found` / `404 cycle_not_found` |
+| 采集包：编号复用但记录集合不同 | `409 package_conflict` |
+| 采集包：包内/库中同标识异内容 | `409 device_conflict` / `cycle_conflict` / `anchor_conflict` / `capture_conflict` |
+| 采集包：引用未在库中且未同包登记的设备/周期 | `404 package_reference_missing` |
+| 采集包：合并后最终锚点序列非严格递增 / 声段倒置 / 空包或字段非法 | `400 anchors_not_increasing` / `400 segment_inverted` / `400 validation_error` / `400 invalid_time` |
+| 采集包：试图向已封存周期新增锚点/声段 | `409 cycle_sealed` |
 
 ### 幂等与冲突
 
@@ -336,6 +388,8 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | PUT | `/devices/{id}/anchors` | **锚点更正**：按周期整体替换 `{cycle_id?, anchors:[...]}`（原子生效） |
 | DELETE | `/devices/{id}/anchors/{local_ms}?cycle_id=` | **锚点更正**：删除单个锚点（省略周期=default） |
 | POST | `/segments` | 提交声段 `{capture_id, device_id, local_start_ms, local_end_ms, cycle_id?, note?}` |
+| POST | `/packages` | **现场断网采集包整包导入** `{package_id, devices?, cycles?, anchors?, segments?}`（顺序不限、整包原子、同包重放幂等） |
+| GET | `/packages` / `/packages/{package_id}` | 已接收采集包列表（计数/时间）/ 首次导入完整结果 |
 | POST | `/segments/reassign-cycle` | **批量纠正周期归属** `{items:[{capture_id, from_cycle_id, to_cycle_id}]}`（整批原子） |
 | GET | `/segments` / `/segments/{capture_id}` | 声段列表（可加 `?device_id=&cycle_id=`）/ 单个 |
 | DELETE | `/segments/{capture_id}` | 删除声段（下一版体现为"移除"） |
@@ -692,6 +746,90 @@ curl -s -X POST $BASE/devices/D1/cycles/default/coverage/rehearse \
 python3 examples/rehearsal_example.py http://localhost:8000
 ```
 
+### 现场断网采集包（恢复网络后整包补传与重试）
+
+```bash
+BASE=http://localhost:8000
+
+# 1. 一个采集包包含多台设备的登记、周期、锚点、声段；顺序不限，
+#    声段可前向引用同包设备/周期，锚点乱序提交按最终序列校验
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' -d '{
+  "package_id":"FIELD-20261006-01",
+  "segments":[
+    {"capture_id":"FIELD-CAP-A","device_id":"FIELD-D1","cycle_id":"boot-2",
+     "local_start_ms":1000,"local_end_ms":61000,"note":"黎明鸟鸣"},
+    {"capture_id":"FIELD-CAP-B","device_id":"FIELD-D2",
+     "local_start_ms":1000,"local_end_ms":20000}
+  ],
+  "anchors":[
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":61000,"utc_ms":1700010060500},
+    {"device_id":"FIELD-D2","local_ms":1000,"utc_ms":1700000001000},
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":1000,"utc_ms":1700010000000},
+    {"device_id":"FIELD-D2","local_ms":20000,"utc_ms":1700000020000}
+  ],
+  "cycles":[{"device_id":"FIELD-D1","cycle_id":"boot-2","note":"第二次开机"}],
+  "devices":[{"device_id":"FIELD-D1","name":"现场录音笔-甲"},
+             {"device_id":"FIELD-D2","name":"现场录音笔-乙"}]
+}'
+# => 201，counts 给出各类 added/reused；segments 为按入库锚点计算的当前定位
+
+# 2. 网络超时后直接重发同一个包（顺序变化、夹带完全相同的重复项也无妨）：
+#    相同记录集合 -> 200 返回首次结果（idempotent_replay=true），不重复写入
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' -d '{
+  "package_id":"FIELD-20261006-01",
+  "devices":[{"device_id":"FIELD-D2","name":"现场录音笔-乙"},
+             {"device_id":"FIELD-D1","name":"现场录音笔-甲"}],
+  "cycles":[{"device_id":"FIELD-D1","cycle_id":"boot-2","note":"第二次开机"}],
+  "anchors":[
+    {"device_id":"FIELD-D2","local_ms":1000,"utc_ms":1700000001000},
+    {"device_id":"FIELD-D2","local_ms":20000,"utc_ms":1700000020000},
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":1000,"utc_ms":1700010000000},
+    {"device_id":"FIELD-D1","cycle_id":"boot-2","local_ms":61000,"utc_ms":1700010060500}
+  ],
+  "segments":[
+    {"capture_id":"FIELD-CAP-B","device_id":"FIELD-D2","local_start_ms":1000,"local_end_ms":20000},
+    {"capture_id":"FIELD-CAP-A","device_id":"FIELD-D1","cycle_id":"boot-2",
+     "local_start_ms":1000,"local_end_ms":61000,"note":"黎明鸟鸣"}
+  ]
+}'
+# => 200 {"idempotent_replay":true,"created_at":"<与首次相同>", ...}
+
+# 3. 明确拒绝（整包回滚，不留下部分数据）：
+# 3a) 编号复用但内容不同 -> 409 package_conflict
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' \
+  -d '{"package_id":"FIELD-20261006-01",
+       "devices":[{"device_id":"FIELD-D1","name":"被篡改的名字"}]}'
+# 3b) 引用缺失（锚点引用未登记且未同包登记的设备）-> 404 package_reference_missing
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' \
+  -d '{"package_id":"FIELD-BAD-1",
+       "anchors":[{"device_id":"GHOST","local_ms":0,"utc_ms":0}]}'
+# 3c) 合并后最终锚点序列非法（FIELD-D2 现有 1000→20000，中间插 utc 过大的点）
+#     -> 400 anchors_not_increasing
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' \
+  -d '{"package_id":"FIELD-BAD-2",
+       "anchors":[{"device_id":"FIELD-D2","local_ms":1500,"utc_ms":1700000999999}]}'
+# 3d) 试图向已封存周期新增声段 -> 409 cycle_sealed（同内容重传仍幂等放行）
+FP=$(curl -s $BASE/devices/FIELD-D2/cycles/default | python3 -c "import sys,json;print(json.load(sys.stdin)['cycle']['fingerprint'])")
+curl -s -X POST $BASE/devices/FIELD-D2/cycles/default/seal -H 'Content-Type: application/json' -d "{\"fingerprint\":\"$FP\"}" >/dev/null
+curl -s -X POST $BASE/packages -H 'Content-Type: application/json' \
+  -d '{"package_id":"FIELD-BAD-3",
+       "segments":[{"capture_id":"FIELD-CAP-X","device_id":"FIELD-D2",
+                    "local_start_ms":2000,"local_end_ms":3000}]}'
+
+# 4. 已接收采集包列表 / 首次导入结果；当前时间轴反映入库结果，已发布版本不变
+curl -s $BASE/packages
+curl -s $BASE/packages/FIELD-20261006-01
+curl -s $BASE/timeline/current
+```
+
+最小可运行复现（自动建包导入、乱序/重复项重试、各类整包拒绝、封存保护与
+版本快照验证）：
+
+```bash
+python3 examples/package_example.py http://localhost:8000
+```
+
+
 最小可运行复现（自动建设备/锚点并验证逐段速率/漂移、超阈值标记、历史版本冻结
 与各类明确错误）：
 
@@ -772,8 +910,9 @@ python3 -m unittest discover -s tests -v
 - `tests/test_clip.py`（18 个）：回放裁剪的窗口相交判定与本地边界"首次不小于"规则（含线性漂移取整与取整平台）、截在声段末端、裁后退化不返回（零长度/边界相接/陡峭漂移）、不可定位声段不返回、同设备重叠分别返回、排序规则、周期感知（只用所属周期锚点）、**历史版本裁剪冻结**（冻结锚点+声段，后续变更不改历史结果）、**旧版（format_rev=1）快照周期归属按 default**、int64 边界、非法输入与版本不存在拒绝且数据不变、裁剪只读、以及**裁剪与更正/发布并发**下每次响应都是一致快照。
 - `tests/test_drift.py`（24 个）：漂移审计的相邻配对速率/漂移（有符号，含偏快/偏慢方向）计算、首尾锚点与本地/UTC 跨度、恰好等于阈值不算超差（精确分数比较，含浮点阈值边界）、低于阈值不标异常、混合段只标超差段与全段最大绝对漂移、周期独立（只用指定周期锚点）、封存周期可审计、**历史版本审计冻结**（后续锚点更正/新发布不改历史结果）、**旧版（format_rev=1）冻结锚点周期归属按 default**（新周期旧版本无冻结锚点仍报锚点不足）、锚点不足/阈值非法（含 NaN/Infinity）/设备/周期/版本不存在明确拒绝且数据不变、审计只读、int64 锚点、纯逻辑（乱序排序/精确边界/锚点不足）以及**审计与更正/发布并发**下每次响应都是一致快照。
 - `tests/test_rehearsal.py`（21 个）：锚点更正覆盖预演的两侧同快照计算（更正前一侧与当前覆盖审计逐字段一致）、整体平移/改善/两侧多段退化（不连通区间分别列出、相邻退化分片合并）、毫秒取整口径与实际更正后审计一致、拟锚点覆盖不足致声段不可定位、同设备重叠只算一台、不可定位声段不计、其他周期与设备保持当前值、指纹过期/格式非法、周期封存拒绝、锚点非严格递增（local 重复/utc 非递增/乱序提交）、时间/区间/门槛非法、空或畸形锚点、缺字段、设备/周期不存在的明确拒绝、成功与被拒绝预演均只读（当前时间轴与已发布版本不变）、以及**预演与实际更正/发布并发**下两侧片段均拼满查询区间且恶化统计自洽。
+- `tests/test_packages.py`（21 个）：采集包整包导入的包内顺序无关（锚点乱序、声段前向引用同包设备/周期）、同内容记录去重、四类记录 added/reused 计数与隐式 default 周期、包内锚点与库内锚点交叉合并的最终序列校验、不可定位声段入库；相同包编号相同集合重传（乱序/重复项）返回首次结果且不重复写入、同包编号并发重传只有一个 201；编号复用内容不同、与库中设备/周期/锚点/声段冲突、包内同标识异内容、引用缺失、最终锚点序列非法、起止倒置、非法字段与空包、变更封存周期（同内容复用放行）、新设备 default note 冲突的整包拒绝且不留部分数据；当前时间轴反映入库而已发布版本不变、**多包导入与发布并发下每个版本无半包状态**；以及既有单条录入/封存/发布调用与结果不受影响。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6 → v1.7）
+## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6 → v1.7 → v1.8）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -785,6 +924,7 @@ python3 -m unittest discover -s tests -v
 - v1.5 新增 `POST /segments/clip` 回放裁剪端点（只读），**无表结构变更**，旧库直接可用；历史版本裁剪基于既有 `version_anchors` / `version_segments` 冻结快照，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可裁剪。
 - v1.6 新增 `POST /devices/{id}/cycles/{cycle_id}/drift-audit` 现场时钟漂移审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_anchors` 冻结锚点，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可审计。
 - v1.7 新增 `POST /devices/{id}/cycles/{cycle_id}/coverage/rehearse` 锚点更正覆盖预演端点（只读），**无表结构变更、无数据迁移**，旧库直接可用；预演仅在读事务快照内做内存锚点替换，从不写入，当前时间轴与已发布版本均不受影响。
+- v1.8 新增 `POST /packages` 现场断网采集包整包导入端点与 `GET /packages`、`GET /packages/{id}` 查询；仅新增一张 `packages` 表（`CREATE TABLE IF NOT EXISTS`，保存包编号、规范记录集合内容指纹与首次导入结果），**不改动既有表结构、无数据迁移**，旧库启动即自动建表；采集包与所有既有写路径共用同一 `BEGIN IMMEDIATE` 写锁，单条录入、封存、发布的既有行为与结果完全不变。
 
 ## 项目结构
 
@@ -804,10 +944,12 @@ tests/test_clip.py     # 端到端测试（回放裁剪 + 历史冻结 + 旧版�
 tests/test_clip_regression.py # 回归测试（报告窗口当前时间轴裁剪 + 排除/拒绝规则）
 tests/test_drift.py    # 端到端测试（现场时钟漂移审计 + 历史冻结 + 旧版快照 + 并发一致性）
 tests/test_rehearsal.py # 端到端测试（锚点更正覆盖预演：两侧同快照对比、恶化区间、只读与拒绝契约）
-examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪、漂移审计与更正预演）
-examples/client.py     # Python 客户端示例（含更正预演等全部 v1.7 能力）
+tests/test_packages.py  # 端到端测试（现场断网采集包：顺序无关、整包原子、重传幂等、并发无半包）
+examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪、漂移审计、更正预演与采集包）
+examples/client.py     # Python 客户端示例（含更正预演、采集包整包导入等全部 v1.8 能力）
 examples/clip_example.py # 回放裁剪报告窗口最小复现示例
 examples/drift_example.py # 现场时钟漂移审计最小复现示例
 examples/rehearsal_example.py # 锚点更正覆盖预演最小复现示例
+examples/package_example.py # 现场断网采集包整包导入与重试最小复现示例
 Dockerfile / docker-compose.yml
 ```

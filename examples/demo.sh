@@ -371,3 +371,66 @@ curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
   -H 'Content-Type: application/json' \
   -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
        \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+
+# ============================================================
+# v1.8 现场断网采集包整包导入（POST /packages）
+# ============================================================
+echo
+echo "================ v1.8 现场断网采集包 ================"
+echo "-- 1) 整包补传：设备/周期/锚点/声段顺序不限，声段可前向引用同包设备/周期；
+     锚点乱序提交按最终序列校验，不因上传顺序误拒 --"
+curl -s -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{
+    "package_id":"DEMO-PKG-1",
+    "segments":[
+      {"capture_id":"DEMO-CAP-A","device_id":"PD1","cycle_id":"boot-2",
+       "local_start_ms":1000,"local_end_ms":61000,"note":"断网期录音-甲"},
+      {"capture_id":"DEMO-CAP-B","device_id":"PD2",
+       "local_start_ms":1000,"local_end_ms":2000}
+    ],
+    "anchors":[
+      {"device_id":"PD1","cycle_id":"boot-2","local_ms":61000,"utc_ms":1700010060500},
+      {"device_id":"PD2","local_ms":2000,"utc_ms":1700000002000},
+      {"device_id":"PD1","cycle_id":"boot-2","local_ms":1000,"utc_ms":1700010000000},
+      {"device_id":"PD2","local_ms":1000,"utc_ms":1700000001000}
+    ],
+    "cycles":[{"device_id":"PD1","cycle_id":"boot-2","note":"第二次开机"}],
+    "devices":[{"device_id":"PD1","name":"断网录音笔-甲"},
+               {"device_id":"PD2","name":"断网录音笔-乙"}]
+  }' | pp
+echo "-- 2) 网络重试：同编号同记录集合（乱序/重复项均可）-> 200 返回首次结果 --"
+curl -s -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{
+    "package_id":"DEMO-PKG-1",
+    "devices":[{"device_id":"PD2","name":"断网录音笔-乙"},
+               {"device_id":"PD1","name":"断网录音笔-甲"}],
+    "cycles":[{"device_id":"PD1","cycle_id":"boot-2","note":"第二次开机"}],
+    "anchors":[
+      {"device_id":"PD2","local_ms":1000,"utc_ms":1700000001000},
+      {"device_id":"PD2","local_ms":2000,"utc_ms":1700000002000},
+      {"device_id":"PD1","cycle_id":"boot-2","local_ms":1000,"utc_ms":1700010000000},
+      {"device_id":"PD1","cycle_id":"boot-2","local_ms":61000,"utc_ms":1700010060500}
+    ],
+    "segments":[
+      {"capture_id":"DEMO-CAP-B","device_id":"PD2",
+       "local_start_ms":1000,"local_end_ms":2000},
+      {"capture_id":"DEMO-CAP-A","device_id":"PD1","cycle_id":"boot-2",
+       "local_start_ms":1000,"local_end_ms":61000,"note":"断网期录音-甲"}
+    ]
+  }' | pp
+echo "-- 3a) 编号复用但内容不同 -> 409 package_conflict（整包拒绝）--"
+curl -s -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"package_id":"DEMO-PKG-1",
+       "devices":[{"device_id":"PD1","name":"被篡改的名字"}]}' | pp
+echo "-- 3b) 引用缺失（锚点引用未登记设备/周期）-> 404 package_reference_missing --"
+curl -s -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"package_id":"DEMO-PKG-2",
+       "anchors":[{"device_id":"GHOST","local_ms":0,"utc_ms":0}]}' | pp
+echo "-- 3c) 合并后最终锚点序列非法（PD2 在 local=1500 插入 utc 大于后锚点）
+        -> 400 anchors_not_increasing，不留下部分数据 --"
+curl -s -X POST "$BASE/packages" -H 'Content-Type: application/json' \
+  -d '{"package_id":"DEMO-PKG-3",
+       "anchors":[{"device_id":"PD2","local_ms":1500,"utc_ms":1700000999999}]}' | pp
+echo "-- 4) 已接收采集包列表 / 首次导入结果 --"
+curl -s "$BASE/packages" | pp
+curl -s "$BASE/packages/DEMO-PKG-1" | pp

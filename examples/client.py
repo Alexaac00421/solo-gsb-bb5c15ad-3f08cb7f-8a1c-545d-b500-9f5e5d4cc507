@@ -94,6 +94,36 @@ class TimelineClient:
         """
         return self._call("POST", "/segments/reassign-cycle", {"items": items})
 
+    # 现场断网采集包整包导入（v1.8）
+    def import_package(self, package_id: str, devices: list[dict] | None = None,
+                       cycles: list[dict] | None = None,
+                       anchors: list[dict] | None = None,
+                       segments: list[dict] | None = None):
+        """断网采集包一次性补传：设备/周期/锚点/声段四类记录顺序不限，
+        记录可前向引用同包登记的设备与周期。
+
+        相同 package_id 的相同记录集合重传返回首次结果（200，
+        idempotent_replay=true）且不重复写入；编号复用为不同内容、同标识
+        记录与库中冲突、引用缺失、锚点最终序列非法、变更封存周期均整包
+        拒绝（BEGIN IMMEDIATE 单事务，不留下部分数据）。
+        """
+        payload = {"package_id": package_id}
+        if devices is not None:
+            payload["devices"] = devices
+        if cycles is not None:
+            payload["cycles"] = cycles
+        if anchors is not None:
+            payload["anchors"] = anchors
+        if segments is not None:
+            payload["segments"] = segments
+        return self._call("POST", "/packages", payload)
+
+    def list_packages(self):
+        return self._call("GET", "/packages")
+
+    def package(self, package_id: str):
+        return self._call("GET", f"/packages/{package_id}")
+
     # 时间轴与版本
     def timeline(self):
         return self._call("GET", "/timeline/current")

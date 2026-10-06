@@ -28,11 +28,11 @@ from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
                     STATUS_UNLOCATABLE, compute_changes, compute_clips,
                     compute_coverage, compute_drift_report,
                     compute_rehearsal_regressions, cycle_fingerprint,
-                    project_segment, require_fields, require_payload,
-                    segment_content_hash, sort_projections, validate_anchor_chain,
-                    validate_cycle_id, validate_fingerprint, validate_id,
-                    validate_max_drift_ppm, validate_min_devices, validate_ms,
-                    validate_note)
+                    package_content_hash, project_segment, require_fields,
+                    require_payload, segment_content_hash, sort_projections,
+                    validate_anchor_chain, validate_cycle_id,
+                    validate_fingerprint, validate_id, validate_max_drift_ppm,
+                    validate_min_devices, validate_ms, validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -792,6 +792,489 @@ def reassign_segment_cycles(db_path: str, body):
     return 200, {"moved": len(moves), "segments": projs, "cycles": cycle_fps,
                  "message": "周期归属已批量纠正：声段起止、备注、创建时间与采集编号"
                             "保持不变，已按目标周期锚点重算定位"}
+
+
+# ---------------------------------------------------------------- 现场采集包（v1.8）
+
+_CYCLE_MISSING = object()  # 周期在库内与同包隐式 default 中均不存在的哨兵
+
+
+def _parse_package_section(payload, name, required, validators):
+    """解析采集包中的一段记录列表。
+
+    - 缺省（键不存在或 null）按空列表处理；非数组 -> 400 validation_error；
+    - 每项必须是对象，缺必填字段 -> 400 validation_error；
+    - validators 给出全部字段的校验函数（含可选字段）；可选字段缺省时按
+      None 传入校验函数（validate_cycle_id / validate_note 据此回落到
+      default / None），保证输出记录字段齐全、与既有字段规则一致。
+    """
+    raw = payload.get(name)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ApiError(400, "validation_error", f"{name} 必须是数组",
+                       {"section": name, "received_type": type(raw).__name__})
+    items = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error",
+                           f"{name}[{i}] 必须是对象",
+                           {"section": name, "index": i,
+                            "received_type": type(item).__name__})
+        require_fields(item, required)
+        rec = {}
+        for k, v in validators.items():
+            rec[k] = v(item.get(k), f"{name}[{i}].{k}")
+        items.append(rec)
+    return items
+
+
+def _optional_str(value, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ApiError(400, "validation_error", f"{field} 必须是字符串",
+                       {"field": field, "value": value})
+    return value
+
+
+def _dedup_identical(items, keyfn, conflict_code, conflict_message, label):
+    """按主键合并包内记录：同主键同内容 -> 去重（包内顺序不限、重复项不算新增）；
+    同主键异内容 -> 409 整包拒绝（同标识记录与包内另一记录冲突）。"""
+    by_key: dict = {}
+    conflicts = []
+    for item in items:
+        key = keyfn(item)
+        if key in by_key:
+            if by_key[key] != item:
+                conflicts.append({"key": list(key) if isinstance(key, tuple) else key,
+                                  "existing": by_key[key], "received": item})
+            continue
+        by_key[key] = item
+    if conflicts:
+        raise ApiError(409, conflict_code, conflict_message, {label: conflicts})
+    return list(by_key.values())
+
+
+def import_package(db_path: str, body):
+    """现场断网采集包一次性补传（v1.8）：整包登记设备/周期/锚点/声段。
+
+    - 请求体 {package_id, devices?, cycles?, anchors?, segments?}，四类记录
+      均可缺省（至少一类非空），包内顺序不限，记录可引用同包登记的设备与
+      周期（前向引用允许，按合并后的最终状态校验，不因上传顺序误拒）；
+    - 所有字段沿用既有规则（ID 命名、毫秒整数、声段不倒置等）；每周期锚点
+      按"库内现存 + 包内新增"合并后的最终序列校验严格递增，包内乱序提交
+      由服务按 local_ms 排序后检查（只拒绝真正非单调的序列）；
+    - 同标识已存在的记录：设备同 name / 周期同 note / 锚点同 utc_ms /
+      声段同内容指纹计为复用（不写入）；异内容分别报 device_conflict /
+      cycle_conflict / anchor_conflict / capture_conflict；
+    - 引用缺失（设备或周期在库内与包内均不存在）-> 404 package_reference_missing；
+      试图向已封存周期新增锚点/声段 -> 409 cycle_sealed；
+    - 相同 package_id 的相同记录集合重传 -> 200 返回首次结果且不重复写入；
+      编号复用但内容不同 -> 409 package_conflict；
+    - 全部"校验 + 写入 + 包记录落盘"在单个 BEGIN IMMEDIATE 事务内完成，
+      任一失败整包回滚、不留下部分数据；与单条录入、封存、发布共用写锁，
+      并发导入与发布都观察不到半包状态。已发布版本保持原快照。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["package_id"])
+    package_id = validate_id(payload["package_id"], "package_id")
+
+    devices = _parse_package_section(
+        payload, "devices", ["device_id"],
+        {"device_id": validate_id, "name": _optional_str})
+    cycles = _parse_package_section(
+        payload, "cycles", ["device_id", "cycle_id"],
+        {"device_id": validate_id, "cycle_id": validate_id,
+         "note": lambda v, f: validate_note(v)})
+    anchors = _parse_package_section(
+        payload, "anchors", ["device_id", "local_ms", "utc_ms"],
+        {"device_id": validate_id,
+         "cycle_id": lambda v, f: validate_cycle_id(v),
+         "local_ms": validate_ms, "utc_ms": validate_ms})
+    segments = _parse_package_section(
+        payload, "segments",
+        ["capture_id", "device_id", "local_start_ms", "local_end_ms"],
+        {"capture_id": validate_id, "device_id": validate_id,
+         "cycle_id": lambda v, f: validate_cycle_id(v),
+         "local_start_ms": validate_ms, "local_end_ms": validate_ms,
+         "note": lambda v, f: validate_note(v)})
+    if not (devices or cycles or anchors or segments):
+        raise ApiError(400, "validation_error",
+                       "采集包至少包含一类记录（devices / cycles / anchors / segments）",
+                       {"package_id": package_id})
+    for i, s in enumerate(segments):
+        if s["local_start_ms"] > s["local_end_ms"]:
+            raise ApiError(400, "segment_inverted",
+                           f"声段起点 local_start_ms={s['local_start_ms']} 大于终点 "
+                           f"local_end_ms={s['local_end_ms']}，起止倒置，整包拒绝写入",
+                           {"index": i, "segment": s})
+
+    # 包内同主键记录：完全相同 -> 去重（顺序不限）；同主键异内容 -> 整包拒绝
+    devices = _dedup_identical(
+        devices, lambda d: d["device_id"],
+        "device_conflict",
+        "包内存在相同 device_id 但 name 不一致的登记记录，整包拒绝", "devices")
+    cycles = _dedup_identical(
+        cycles, lambda c: (c["device_id"], c["cycle_id"]),
+        "cycle_conflict",
+        "包内存在相同 (device_id, cycle_id) 但 note 不一致的周期记录，整包拒绝",
+        "cycles")
+    anchors = _dedup_identical(
+        anchors, lambda a: (a["device_id"], a["cycle_id"], a["local_ms"]),
+        "anchor_conflict",
+        "包内存在相同 (设备, 周期, local_ms) 但 utc_ms 不一致的锚点记录，整包拒绝",
+        "anchors")
+    segments = _dedup_identical(
+        segments, lambda s: s["capture_id"],
+        "capture_conflict",
+        "包内存在相同 capture_id 但内容不一致的声段记录，整包拒绝", "segments")
+
+    devices.sort(key=lambda d: d["device_id"])
+    cycles.sort(key=lambda c: (c["device_id"], c["cycle_id"]))
+    anchors.sort(key=lambda a: (a["device_id"], a["cycle_id"], a["local_ms"]))
+    segments.sort(key=lambda s: s["capture_id"])
+    content_hash = package_content_hash(devices, cycles, anchors, segments)
+
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            existing_pkg = conn.execute(
+                "SELECT package_id, content_hash, result_json, created_at "
+                "FROM packages WHERE package_id=?", (package_id,)).fetchone()
+            if existing_pkg:
+                if existing_pkg["content_hash"] != content_hash:
+                    raise ApiError(
+                        409, "package_conflict",
+                        f"采集包编号 {package_id} 已用于另一份不同的记录集合，"
+                        f"包编号不可复用为不同内容，整包拒绝",
+                        {"package_id": package_id,
+                         "existing_content_hash": existing_pkg["content_hash"],
+                         "received_content_hash": content_hash})
+                # 相同记录集合重传：返回首次结果，不重复写入
+                import json as _json
+                result = _json.loads(existing_pkg["result_json"])
+                result["idempotent_replay"] = True
+                return 200, result
+
+            # ---- 库内冲突 / 引用 / 封存 / 最终锚点序列校验（失败即整包回滚）----
+            pkg_devices = {d["device_id"] for d in devices}
+            pkg_cycles = {(c["device_id"], c["cycle_id"]) for c in cycles}
+
+            device_rows = {r["device_id"]: dict(r) for r in conn.execute(
+                "SELECT device_id, name FROM devices")}
+            cycle_rows = {(r["device_id"], r["cycle_id"]): dict(r) for r in conn.execute(
+                "SELECT device_id, cycle_id, note, sealed_at FROM cycles")}
+            new_device_ids = pkg_devices - set(device_rows)
+            # 新设备登记时会隐式创建 note=None 的 default 周期（与 POST /devices
+            # 一致）；包内显式提交同设备 default 周期且 note 非空即与其冲突。
+            implicit_defaults = {(d, DEFAULT_CYCLE_ID) for d in new_device_ids}
+
+            def existing_cycle_note(dev, cyc):
+                row = cycle_rows.get((dev, cyc))
+                if row is not None:
+                    return row["note"]
+                if (dev, cyc) in implicit_defaults:
+                    return None  # 新设备隐式 default 的 note
+                return _CYCLE_MISSING
+
+            device_conflicts = [
+                {"device_id": d["device_id"], "name": d["name"],
+                 "existing_name": device_rows[d["device_id"]]["name"]}
+                for d in devices if d["device_id"] in device_rows
+                and device_rows[d["device_id"]]["name"] != d["name"]]
+            if device_conflicts:
+                raise ApiError(409, "device_conflict",
+                               "包内设备与库中已登记设备 name 不一致，整包拒绝，不写入任何数据",
+                               {"devices": device_conflicts})
+            cycle_conflicts = []
+            for c in cycles:
+                note = existing_cycle_note(c["device_id"], c["cycle_id"])
+                if note is not _CYCLE_MISSING and note != c["note"]:
+                    cycle_conflicts.append(
+                        {"device_id": c["device_id"], "cycle_id": c["cycle_id"],
+                         "note": c["note"], "existing_note": note})
+            if cycle_conflicts:
+                raise ApiError(409, "cycle_conflict",
+                               "包内周期与库中已登记周期 note 不一致（新设备的 default "
+                               "周期固定为空 note），整包拒绝，不写入任何数据",
+                               {"cycles": cycle_conflicts})
+
+            # 引用缺失：锚点/声段引用的设备、周期须存在于库内、同包显式登记，
+            # 或为新设备登记时隐式创建的 default 周期。
+            def cycle_known(dev, cyc):
+                return ((dev, cyc) in pkg_cycles or (dev, cyc) in cycle_rows
+                        or (dev, cyc) in implicit_defaults)
+
+            missing_refs = []
+            for a in anchors:
+                if a["device_id"] not in pkg_devices and a["device_id"] not in device_rows:
+                    missing_refs.append({"kind": "device", "record": "anchor",
+                                         "device_id": a["device_id"],
+                                         "cycle_id": a["cycle_id"]})
+                elif not cycle_known(a["device_id"], a["cycle_id"]):
+                    missing_refs.append({"kind": "cycle", "record": "anchor",
+                                         "device_id": a["device_id"],
+                                         "cycle_id": a["cycle_id"]})
+            for s in segments:
+                if s["device_id"] not in pkg_devices and s["device_id"] not in device_rows:
+                    missing_refs.append({"kind": "device", "record": "segment",
+                                         "capture_id": s["capture_id"],
+                                         "device_id": s["device_id"],
+                                         "cycle_id": s["cycle_id"]})
+                elif not cycle_known(s["device_id"], s["cycle_id"]):
+                    missing_refs.append({"kind": "cycle", "record": "segment",
+                                         "capture_id": s["capture_id"],
+                                         "device_id": s["device_id"],
+                                         "cycle_id": s["cycle_id"]})
+            if missing_refs:
+                raise ApiError(404, "package_reference_missing",
+                               "包内锚点/声段引用了未在库中且未在同包登记的设备或周期，"
+                               "整包拒绝，不写入任何数据",
+                               {"missing": missing_refs})
+
+            # 与库内已存在锚点（同设备/周期/local_ms）冲突：utc_ms 不一致即拒绝
+            existing_anchor_rows = {}
+            if anchors:
+                # 设备与周期可能由同包登记，这里按包内涉及设备过滤后再按键比对
+                dset = sorted({a["device_id"] for a in anchors})
+                dmarks = ",".join("?" for _ in dset)
+                rows = conn.execute(
+                    f"SELECT device_id, cycle_id, local_ms, utc_ms FROM anchors "
+                    f"WHERE device_id IN ({dmarks})", dset).fetchall()
+                existing_anchor_rows = {(r["device_id"], r["cycle_id"], r["local_ms"]):
+                                        dict(r) for r in rows}
+            pkg_anchor_keys = {(a["device_id"], a["cycle_id"], a["local_ms"])
+                               for a in anchors}
+            # 只统计包内引用到的已存锚点（同设备其他周期锚点不计入本包复用）
+            anchor_rows = {k: r for k, r in existing_anchor_rows.items()
+                           if k in pkg_anchor_keys}
+            anchor_conflicts = [
+                {"device_id": a["device_id"], "cycle_id": a["cycle_id"],
+                 "local_ms": a["local_ms"], "utc_ms": a["utc_ms"],
+                 "existing_utc_ms": anchor_rows[
+                     (a["device_id"], a["cycle_id"], a["local_ms"])]["utc_ms"]}
+                for a in anchors
+                if (a["device_id"], a["cycle_id"], a["local_ms"]) in anchor_rows
+                and anchor_rows[(a["device_id"], a["cycle_id"],
+                                 a["local_ms"])]["utc_ms"] != a["utc_ms"]]
+            if anchor_conflicts:
+                raise ApiError(409, "anchor_conflict",
+                               "包内锚点与库中同 (设备, 周期, local_ms) 锚点 utc_ms "
+                               "不一致，整包拒绝，不写入任何数据",
+                               {"anchors": anchor_conflicts})
+
+            # 声段：按既有内容指纹判定同内容复用 / 异内容冲突
+            seg_rows = {}
+            if segments:
+                ids = [s["capture_id"] for s in segments]
+                smarks = ",".join("?" for _ in ids)
+                for r in conn.execute(
+                        f"SELECT * FROM segments WHERE capture_id IN ({smarks})", ids):
+                    seg_rows[r["capture_id"]] = dict(r)
+            seg_conflicts = []
+            for s in segments:
+                row = seg_rows.get(s["capture_id"])
+                if row is None:
+                    continue
+                digest = segment_content_hash(
+                    s["capture_id"], s["device_id"], s["cycle_id"],
+                    s["local_start_ms"], s["local_end_ms"], s["note"])
+                if row["content_hash"] != digest:
+                    seg_conflicts.append({"existing": _row_to_segment(row), "received": s})
+            if seg_conflicts:
+                raise ApiError(409, "capture_conflict",
+                               "包内声段采集编号已存在且内容不一致，整包拒绝，不写入任何数据",
+                               {"segments": seg_conflicts})
+
+            # 封存周期：包内"新增"锚点/声段不得触及已封存周期
+            # （同内容复用锚点/声段不改变内容，沿用既有幂等规则，允许通过）。
+            sealed_cycles: dict[tuple[str, str], dict] = {}
+
+            def sealed_state(device_id, cycle_id):
+                key = (device_id, cycle_id)
+                if key not in sealed_cycles:
+                    sealed_cycles[key] = cycle_rows.get(key)
+                return sealed_cycles[key]
+
+            sealed_violations = []
+            for a in anchors:
+                akey = (a["device_id"], a["cycle_id"], a["local_ms"])
+                if akey not in existing_anchor_rows:  # 复用锚点不改变封存周期
+                    cyc = sealed_state(a["device_id"], a["cycle_id"])
+                    if cyc is not None and cyc["sealed_at"] is not None:
+                        sealed_violations.append({"record": "anchor",
+                                                  "device_id": a["device_id"],
+                                                  "cycle_id": a["cycle_id"],
+                                                  "sealed_at": cyc["sealed_at"]})
+            for s in segments:
+                if s["capture_id"] not in seg_rows:  # 复用声段保持既有幂等
+                    cyc = sealed_state(s["device_id"], s["cycle_id"])
+                    if cyc is not None and cyc["sealed_at"] is not None:
+                        sealed_violations.append({"record": "segment",
+                                                  "capture_id": s["capture_id"],
+                                                  "device_id": s["device_id"],
+                                                  "cycle_id": s["cycle_id"],
+                                                  "sealed_at": cyc["sealed_at"]})
+            if sealed_violations:
+                uniq = {(v["device_id"], v["cycle_id"]): v for v in sealed_violations}
+                raise ApiError(409, "cycle_sealed",
+                               "采集包试图向已封存周期新增锚点/声段，整包拒绝，不写入任何数据",
+                               {"violations": sealed_violations,
+                                "cycles": [{"device_id": d, "cycle_id": c,
+                                            "sealed_at": v["sealed_at"]}
+                                           for (d, c), v in sorted(uniq.items())]})
+
+            # 每周期最终锚点序列（库内现存 + 包内新增复用项去重）须 UTC 严格递增；
+            # 包内乱序提交按 local_ms 排序后检查，不因上传顺序误拒。
+            pkg_anchor_cycles = {(a["device_id"], a["cycle_id"]) for a in anchors}
+            final_chains: dict[tuple[str, str], list[tuple[int, int]]] = {}
+            # 现存序列取涉及设备的全部锚点（含包内未显式提交的同周期锚点），
+            # 与包内新增合并后才是每周期的"最终锚点序列"
+            for (dev, cyc, local_ms), r in existing_anchor_rows.items():
+                final_chains.setdefault((dev, cyc), []).append((local_ms, r["utc_ms"]))
+            for a in anchors:
+                chain = final_chains.setdefault((a["device_id"], a["cycle_id"]), [])
+                if not any(p[0] == a["local_ms"] for p in chain):
+                    chain.append((a["local_ms"], a["utc_ms"]))
+            for (dev, cyc), chain in final_chains.items():
+                if (dev, cyc) not in pkg_anchor_cycles:
+                    continue  # 包内未触及的周期序列保持原样（写入时已校验），不复查
+                try:
+                    validate_anchor_chain(chain)
+                except ApiError as e:
+                    raise ApiError(
+                        400, "anchors_not_increasing",
+                        f"设备 {dev} 周期 {cyc} 合并后的最终锚点序列不满足"
+                        f"本地时间唯一且 UTC 严格递增，整包拒绝，不写入任何数据",
+                        {**e.details, "device_id": dev, "cycle_id": cyc})
+
+            # ---- 全部校验通过：整包写入 ----
+            now = iso_now()
+            added_cycles = []
+            for d in devices:
+                if d["device_id"] not in device_rows:
+                    conn.execute(
+                        "INSERT INTO devices(device_id, name, created_at) VALUES (?,?,?)",
+                        (d["device_id"], d["name"], now))
+                    # 新设备登记即隐式创建 default 周期（与 POST /devices 一致）
+                    conn.execute(
+                        "INSERT INTO cycles(device_id, cycle_id, note, created_at) "
+                        "VALUES (?,?,?,?)",
+                        (d["device_id"], DEFAULT_CYCLE_ID, None, now))
+                    added_cycles.append((d["device_id"], DEFAULT_CYCLE_ID))
+            for c in cycles:
+                key = (c["device_id"], c["cycle_id"])
+                if key not in cycle_rows and key not in added_cycles:
+                    conn.execute(
+                        "INSERT INTO cycles(device_id, cycle_id, note, created_at) "
+                        "VALUES (?,?,?,?)",
+                        (c["device_id"], c["cycle_id"], c["note"], now))
+                    added_cycles.append(key)
+            for a in anchors:
+                key = (a["device_id"], a["cycle_id"], a["local_ms"])
+                if key not in anchor_rows:
+                    conn.execute(
+                        "INSERT INTO anchors(device_id, cycle_id, local_ms, utc_ms, created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (a["device_id"], a["cycle_id"], a["local_ms"],
+                         a["utc_ms"], now))
+            inserted_segments = []
+            for s in segments:
+                if s["capture_id"] in seg_rows:
+                    continue
+                digest = segment_content_hash(
+                    s["capture_id"], s["device_id"], s["cycle_id"],
+                    s["local_start_ms"], s["local_end_ms"], s["note"])
+                conn.execute(
+                    """INSERT INTO segments(capture_id, device_id, cycle_id,
+                                            local_start_ms, local_end_ms,
+                                            note, content_hash, created_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (s["capture_id"], s["device_id"], s["cycle_id"],
+                     s["local_start_ms"], s["local_end_ms"], s["note"],
+                     digest, now))
+                inserted_segments.append(s)
+
+            anchors_map = _anchors_map(conn)
+            # 复用声段沿用原创建时间；新增声段使用本包导入时间
+            proj_inputs = []
+            for s in segments:
+                if s["capture_id"] in seg_rows:
+                    proj_inputs.append(_row_to_segment(seg_rows[s["capture_id"]]))
+                else:
+                    proj_inputs.append({**s, "created_at": now})
+            projs = sort_projections([
+                project_segment(seg,
+                                anchors_map.get((seg["device_id"], seg["cycle_id"]),
+                                                ([], [])))
+                for seg in proj_inputs])
+
+            added_device_ids = {d["device_id"] for d in devices} - set(device_rows)
+            reused_device_ids = {d["device_id"] for d in devices} & set(device_rows)
+            reused_cycle_ids = {(c["device_id"], c["cycle_id"]) for c in cycles
+                                if (c["device_id"], c["cycle_id"]) in cycle_rows}
+            result = {
+                "package_id": package_id,
+                "created_at": now,
+                "counts": {
+                    "devices": {"added": len(added_device_ids),
+                                "reused": len(reused_device_ids)},
+                    # cycles.added 含新设备登记时隐式创建的 default 周期；
+                    # 复用仅统计包内显式提交且库中已存在的周期记录
+                    "cycles": {"added": len(added_cycles),
+                               "reused": len(reused_cycle_ids)},
+                    "anchors": {"added": len(anchors) - len(anchor_rows),
+                                "reused": len(anchor_rows)},
+                    "segments": {"added": len(inserted_segments),
+                                 "reused": len(segments) - len(inserted_segments)},
+                },
+                "segments": projs,
+                "segment_count": len(projs),
+                "content_hash": content_hash,
+            }
+            # 与包记录同一事务落盘：重传时原样返回首次结果
+            import json as _json
+            conn.execute(
+                "INSERT INTO packages(package_id, content_hash, result_json, created_at) "
+                "VALUES (?,?,?,?)",
+                (package_id, content_hash,
+                 _json.dumps({**result, "idempotent_replay": False},
+                             ensure_ascii=False), now))
+            result["idempotent_replay"] = False
+            return 201, result
+
+
+def list_packages(db_path: str):
+    """已接收采集包列表（含首次导入结果的计数与时间，便于核对重传）。"""
+    with db.session(db_path) as conn, db.read_txn(conn):
+        rows = conn.execute(
+            "SELECT package_id, content_hash, result_json, created_at "
+            "FROM packages ORDER BY package_id").fetchall()
+        import json as _json
+        packages = []
+        for r in rows:
+            result = _json.loads(r["result_json"])
+            packages.append({"package_id": r["package_id"],
+                             "content_hash": r["content_hash"],
+                             "created_at": r["created_at"],
+                             "counts": result["counts"],
+                             "segment_count": result.get("segment_count")})
+        return 200, {"packages": packages, "count": len(packages)}
+
+
+def get_package(db_path: str, package_id: str):
+    """采集包详情：返回首次导入的完整结果（不随之后的锚点更正/声段增删变化）。"""
+    with db.session(db_path) as conn, db.read_txn(conn):
+        r = conn.execute(
+            "SELECT package_id, content_hash, result_json, created_at "
+            "FROM packages WHERE package_id=?", (package_id,)).fetchone()
+        if not r:
+            raise ApiError(404, "package_not_found",
+                           f"采集包 {package_id} 不存在", {"package_id": package_id})
+        import json as _json
+        result = _json.loads(r["result_json"])
+        result["content_hash"] = r["content_hash"]
+        return 200, {"package": result}
 
 
 # ---------------------------------------------------------------- 当前时间轴

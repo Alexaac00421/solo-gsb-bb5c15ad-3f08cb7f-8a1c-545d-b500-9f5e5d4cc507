@@ -328,6 +328,25 @@ def cycle_fingerprint(device_id: str, cycle_id: str,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------- 现场采集包
+
+def package_content_hash(devices: list[dict], cycles: list[dict],
+                         anchors: list[dict], segments: list[dict]) -> str:
+    """采集包内容指纹：对"包内记录集合本身"做规范序列化（与记录顺序、重复项
+    无关），得到 sha256。
+
+    用于"相同包编号的相同记录集合重传返回首次结果；编号复用但内容不同整包
+    拒绝"。只计入各记录的业务字段（note 等既有字段规则照常保留），不计入
+    服务端生成的 created_at、定位投影或包内排列顺序。调用方须先按各自主键
+    去重并排序。
+    """
+    canonical = json.dumps(
+        {"devices": devices, "cycles": cycles,
+         "anchors": anchors, "segments": segments},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 # ---------------------------------------------------------------- 版本差异
 
 def compute_changes(prev_list: list[dict], curr_list: list[dict]) -> dict:

@@ -57,6 +57,9 @@ def h_root(ctx, body, query):
             "PUT    /devices/{device_id}/anchors            # 锚点更正（按周期整体替换）",
             "DELETE /devices/{device_id}/anchors/{local_ms} # 锚点更正（删除单个，默认 default 周期）",
             "POST   /segments                                      # body 可带 cycle_id，省略=default",
+            "POST   /packages                                      # 现场断网采集包整包导入（设备/周期/锚点/声段，包内顺序不限）",
+            "GET    /packages                                      # 已接收采集包列表（计数与首次导入时间）",
+            "GET    /packages/{package_id}                         # 采集包详情（首次导入结果，重传原样返回）",
             "POST   /segments/reassign-cycle           # 批量纠正声段周期归属（整批原子）",
             "POST   /segments/clip                     # 回放裁剪：按 UTC 半开窗口裁出可回放片段",
             "POST   /devices/{device_id}/cycles/{cycle_id}/drift-audit "
@@ -137,6 +140,18 @@ def h_reassign_segment_cycles(ctx, body, query):
     return service.reassign_segment_cycles(ctx.db_path, body)
 
 
+def h_import_package(ctx, body, query):
+    return service.import_package(ctx.db_path, body)
+
+
+def h_list_packages(ctx, body, query):
+    return service.list_packages(ctx.db_path)
+
+
+def h_get_package(ctx, body, query, package_id):
+    return service.get_package(ctx.db_path, validate_id(package_id, "package_id"))
+
+
 def h_list_segments(ctx, body, query):
     device_id = query.get("device_id", [None])[0]
     cycle_id = _cycle_query(query)
@@ -207,6 +222,9 @@ ROUTES = [
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),
     ("DELETE", r"^/devices/(?P<device_id>[^/]+)/anchors/(?P<local_ms>[^/]+)$", h_delete_anchor),
     ("POST", r"^/segments$", h_submit_segment),
+    ("POST", r"^/packages$", h_import_package),
+    ("GET", r"^/packages$", h_list_packages),
+    ("GET", r"^/packages/(?P<package_id>[^/]+)$", h_get_package),
     ("POST", r"^/segments/reassign-cycle$", h_reassign_segment_cycles),
     ("POST", r"^/segments/clip$", h_clip_segments),
     ("GET", r"^/segments$", h_list_segments),
