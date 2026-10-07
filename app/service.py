@@ -18,15 +18,25 @@
 声明预期原周期与目标周期，任一项无效即整批拒绝（不改动任何数据）；
 成功后声段起止/备注/创建时间/采集编号不变，内容指纹按新周期重算，
 各声段按目标周期锚点重算定位，相关周期内容指纹随之更新。
+
+采集包导入（bundle，v1.8）：现场设备断网期间把多台设备的登记信息、
+时钟周期、同步锚点与声段汇成一个采集包，恢复后整包上传。包内记录
+顺序不限、可引用同包登记的设备与周期；锚点按"每周期最终序列"（库中
+现有 + 包内新增合并）校验，不因上传顺序误拒。相同包编号 + 相同记录
+集合重传返回首次结果且不重复写入；编号复用但内容不同、同标识记录与
+库中冲突、引用缺失、锚点序列非法或试图变更封存周期时整包拒绝，不留
+部分数据。整个导入在单个写事务内完成，并发导入与发布都不会观察到
+半包状态。
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
-                    STATUS_UNLOCATABLE, compute_changes, compute_clips,
-                    compute_coverage, compute_drift_report,
+                    STATUS_UNLOCATABLE, bundle_content_hash, compute_changes,
+                    compute_clips, compute_coverage, compute_drift_report,
                     compute_rehearsal_regressions, cycle_fingerprint,
                     project_segment, require_fields, require_payload,
                     segment_content_hash, sort_projections, validate_anchor_chain,
@@ -792,6 +802,397 @@ def reassign_segment_cycles(db_path: str, body):
     return 200, {"moved": len(moves), "segments": projs, "cycles": cycle_fps,
                  "message": "周期归属已批量纠正：声段起止、备注、创建时间与采集编号"
                             "保持不变，已按目标周期锚点重算定位"}
+
+
+# ---------------------------------------------------------------- 采集包导入
+
+def _bundle_record_list(payload: dict, key: str) -> list:
+    """采集包的某类记录列表：省略或为 null 视为空；非数组 -> 400。"""
+    value = payload.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ApiError(400, "validation_error", f"{key} 必须是数组",
+                       {"field": key, "received_type": type(value).__name__})
+    return value
+
+
+def _parse_bundle_devices(items: list) -> dict:
+    """解析设备登记记录 {device_id, name?}：精确重复去重；同编号 name 不一致 -> 409。"""
+    devices: dict[str, dict] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"devices[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["device_id"])
+        device_id = validate_id(item["device_id"], f"devices[{i}].device_id")
+        name = item.get("name")
+        if name is not None and not isinstance(name, str):
+            raise ApiError(400, "validation_error",
+                           f"devices[{i}].name 必须是字符串", {"value": name})
+        rec = {"device_id": device_id, "name": name}
+        existing = devices.get(device_id)
+        if existing is not None and existing != rec:
+            raise ApiError(409, "device_conflict",
+                           f"采集包内设备 {device_id} 出现两条 name 不一致的"
+                           f"登记记录，整包拒绝",
+                           {"existing": existing, "received": rec})
+        devices[device_id] = rec
+    return devices
+
+
+def _parse_bundle_cycles(items: list) -> dict:
+    """解析周期登记记录 {device_id, cycle_id, note?}：精确重复去重；
+    同 (设备, 周期) note 不一致 -> 409。"""
+    cycles: dict[tuple[str, str], dict] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"cycles[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["device_id", "cycle_id"])
+        device_id = validate_id(item["device_id"], f"cycles[{i}].device_id")
+        cycle_id = validate_id(item["cycle_id"], f"cycles[{i}].cycle_id")
+        note = validate_note(item.get("note"))
+        rec = {"device_id": device_id, "cycle_id": cycle_id, "note": note}
+        key = (device_id, cycle_id)
+        existing = cycles.get(key)
+        if existing is not None and existing != rec:
+            raise ApiError(409, "cycle_conflict",
+                           f"采集包内设备 {device_id} 的周期 {cycle_id} 出现两条"
+                           f" note 不一致的登记记录，整包拒绝",
+                           {"existing": existing, "received": rec})
+        cycles[key] = rec
+    return cycles
+
+
+def _parse_bundle_anchors(items: list) -> dict:
+    """解析锚点记录 {device_id, cycle_id?, local_ms, utc_ms}（省略周期=default）：
+    精确重复去重；同 (设备, 周期, local_ms) 但 UTC 不同 -> 400（最终序列非法）。"""
+    anchors: dict[tuple[str, str, int], dict] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"anchors[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["device_id", "local_ms", "utc_ms"])
+        device_id = validate_id(item["device_id"], f"anchors[{i}].device_id")
+        cycle_id = validate_cycle_id(item.get("cycle_id"))
+        local_ms = validate_ms(item["local_ms"], f"anchors[{i}].local_ms")
+        utc_ms = validate_ms(item["utc_ms"], f"anchors[{i}].utc_ms")
+        rec = {"device_id": device_id, "cycle_id": cycle_id,
+               "local_ms": local_ms, "utc_ms": utc_ms}
+        key = (device_id, cycle_id, local_ms)
+        existing = anchors.get(key)
+        if existing is not None and existing["utc_ms"] != utc_ms:
+            raise ApiError(
+                400, "anchors_not_increasing",
+                f"采集包内设备 {device_id} 周期 {cycle_id} 出现两条本地时间 "
+                f"local_ms={local_ms} 相同但 UTC 不同的锚点，"
+                f"同一周期内锚点本地时间必须唯一，整包拒绝",
+                {"device_id": device_id, "cycle_id": cycle_id,
+                 "local_ms": local_ms})
+        anchors[key] = rec
+    return anchors
+
+
+def _parse_bundle_segments(items: list) -> dict:
+    """解析声段记录 {capture_id, device_id, cycle_id?, local_start_ms,
+    local_end_ms, note?}（省略周期=default）：精确重复去重；
+    同采集编号内容不一致 -> 409。"""
+    segments: dict[str, dict] = {}
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ApiError(400, "validation_error", f"segments[{i}] 必须是对象",
+                           {"received_type": type(item).__name__})
+        require_fields(item, ["capture_id", "device_id",
+                              "local_start_ms", "local_end_ms"])
+        capture_id = validate_id(item["capture_id"], f"segments[{i}].capture_id")
+        device_id = validate_id(item["device_id"], f"segments[{i}].device_id")
+        cycle_id = validate_cycle_id(item.get("cycle_id"))
+        start = validate_ms(item["local_start_ms"],
+                            f"segments[{i}].local_start_ms")
+        end = validate_ms(item["local_end_ms"], f"segments[{i}].local_end_ms")
+        note = validate_note(item.get("note"))
+        if start > end:
+            raise ApiError(400, "segment_inverted",
+                           f"声段 {capture_id} 起点 local_start_ms={start} 大于"
+                           f"终点 local_end_ms={end}，起止倒置，整包拒绝",
+                           {"local_start_ms": start, "local_end_ms": end})
+        rec = {"capture_id": capture_id, "device_id": device_id,
+               "cycle_id": cycle_id, "local_start_ms": start,
+               "local_end_ms": end, "note": note}
+        existing = segments.get(capture_id)
+        if existing is not None and existing != rec:
+            raise ApiError(409, "capture_conflict",
+                           f"采集包内采集编号 {capture_id} 出现两条内容不一致的"
+                           f"声段记录，整包拒绝",
+                           {"existing": existing, "received": rec})
+        segments[capture_id] = rec
+    return segments
+
+
+def import_bundle(db_path: str, body):
+    """采集包导入：断网现场把多台设备的登记信息、时钟周期、同步锚点与声段
+    汇成一个包，恢复网络后整包上传。
+
+    - 请求体 {bundle_id, devices?, cycles?, anchors?, segments?}：四类记录
+      均可省略（视为空）；包内顺序不限，记录可引用同包登记的设备与周期
+      （新登记设备自动带 default 周期）；逐条按既有字段规则校验，精确重复
+      的记录按集合语义去重；
+    - 锚点按"每周期最终序列"校验：库中现有锚点与包内新增锚点合并后，本地
+      时间必须唯一且 UTC 严格递增——与上传顺序无关，不因顺序误拒；与库中
+      完全一致的锚点视为复用，不参与序列变更；
+    - 包级幂等：相同包编号 + 相同记录集合（顺序无关）重传 -> 200 返回首次
+      结果（idempotent_replay: true），不重复写入；包编号复用但内容不同
+      -> 409 bundle_conflict；
+    - 整包原子：同标识记录与库中冲突（device/cycle/capture_conflict）、
+      引用缺失（device/cycle_not_found）、锚点最终序列非法
+      （anchors_not_increasing）、试图变更封存周期（cycle_sealed）——
+      均指出原因并整包拒绝，不留下任何部分数据；
+    - 成功（201）返回各类记录的新增与复用数量；当前时间轴立即反映入库
+      结果，已发布版本保持原快照；导入在单个写事务内完成，并发导入与
+      发布都不会观察到半包状态。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["bundle_id"])
+    bundle_id = validate_id(payload["bundle_id"], "bundle_id")
+    devices = _parse_bundle_devices(_bundle_record_list(payload, "devices"))
+    cycles = _parse_bundle_cycles(_bundle_record_list(payload, "cycles"))
+    anchors = _parse_bundle_anchors(_bundle_record_list(payload, "anchors"))
+    segments = _parse_bundle_segments(_bundle_record_list(payload, "segments"))
+    digest = bundle_content_hash(list(devices.values()), list(cycles.values()),
+                                 list(anchors.values()), list(segments.values()))
+
+    with db.session(db_path) as conn:
+        with db.write_txn(conn):
+            # 1) 包级幂等：同编号同内容 -> 返回首次结果；同编号异内容 -> 拒绝。
+            #    先于一切库状态校验：首次导入成功后即使周期随后被封存，
+            #    重传仍返回首次结果。
+            row = conn.execute(
+                "SELECT content_hash, result FROM bundles WHERE bundle_id=?",
+                (bundle_id,)).fetchone()
+            if row is not None:
+                if row["content_hash"] == digest:
+                    result = json.loads(row["result"])
+                    result["idempotent_replay"] = True
+                    return 200, result
+                raise ApiError(
+                    409, "bundle_conflict",
+                    f"采集包编号 {bundle_id} 已导入且记录集合不一致，"
+                    f"包编号不可复用，整包拒绝",
+                    {"bundle_id": bundle_id})
+
+            # 2) 设备：同标识冲突检测 + 引用解析
+            referenced_devices = (
+                set(devices)
+                | {c["device_id"] for c in cycles.values()}
+                | {a["device_id"] for a in anchors.values()}
+                | {s["device_id"] for s in segments.values()})
+            db_device_names: dict[str, str] = {}
+            for dev in sorted(referenced_devices):
+                r = conn.execute("SELECT name FROM devices WHERE device_id=?",
+                                 (dev,)).fetchone()
+                if r is not None:
+                    db_device_names[dev] = r["name"]
+            device_added, device_reused = [], []
+            for dev, rec in devices.items():
+                if dev in db_device_names:
+                    if db_device_names[dev] != rec["name"]:
+                        raise ApiError(
+                            409, "device_conflict",
+                            f"设备 {dev} 已存在且 name 不一致，整包拒绝",
+                            {"existing": {"device_id": dev,
+                                          "name": db_device_names[dev]},
+                             "received": rec})
+                    device_reused.append(dev)
+                else:
+                    device_added.append(dev)
+            missing_devices = sorted(
+                d for d in referenced_devices
+                if d not in db_device_names and d not in devices)
+            if missing_devices:
+                raise ApiError(
+                    404, "device_not_found",
+                    f"采集包引用了未登记设备: {', '.join(missing_devices)}"
+                    f"（设备须已在库中登记，或随本包 devices 一并登记），整包拒绝",
+                    {"device_ids": missing_devices})
+
+            # 3) 周期：同标识冲突检测 + 引用解析。
+            #    已知周期 = 库中周期 ∪ 本包新设备的隐式 default 周期 ∪ 本包周期记录
+            known_cycles: dict[tuple[str, str], str | None] = {}
+            for dev in sorted(referenced_devices):
+                for r in conn.execute(
+                        "SELECT cycle_id, note FROM cycles WHERE device_id=?",
+                        (dev,)).fetchall():
+                    known_cycles[(dev, r["cycle_id"])] = r["note"]
+            for dev in device_added:
+                known_cycles.setdefault((dev, DEFAULT_CYCLE_ID), None)
+            cycle_added, cycle_reused = [], []
+            for key, rec in cycles.items():
+                if key in known_cycles:
+                    if known_cycles[key] != rec["note"]:
+                        raise ApiError(
+                            409, "cycle_conflict",
+                            f"设备 {key[0]} 的周期 {key[1]} 已存在且 note 不一致，"
+                            f"整包拒绝",
+                            {"existing": {"device_id": key[0], "cycle_id": key[1],
+                                          "note": known_cycles[key]},
+                             "received": rec})
+                    cycle_reused.append(key)
+                else:
+                    cycle_added.append(key)
+                    known_cycles[key] = rec["note"]
+            missing_cycles = sorted(
+                ({(a["device_id"], a["cycle_id"]) for a in anchors.values()}
+                 | {(s["device_id"], s["cycle_id"]) for s in segments.values()})
+                - set(known_cycles))
+            if missing_cycles:
+                raise ApiError(
+                    404, "cycle_not_found",
+                    f"采集包引用了未登记周期（周期须已在库中登记，或随本包 "
+                    f"cycles 一并登记；新登记设备的 default 周期自动可用），"
+                    f"整包拒绝",
+                    {"cycles": [{"device_id": d, "cycle_id": c}
+                                for d, c in missing_cycles]})
+
+            # 4) 声段：同编号与库中内容不一致 -> 拒绝（与单条录入同一判定口径；
+            #    同内容重传为复用，即使所属周期已封存也不视为变更）
+            segment_added, segment_reused = [], []
+            seg_digests: dict[str, str] = {}
+            for cid, rec in segments.items():
+                seg_digest = segment_content_hash(
+                    cid, rec["device_id"], rec["cycle_id"],
+                    rec["local_start_ms"], rec["local_end_ms"], rec["note"])
+                seg_digests[cid] = seg_digest
+                r = conn.execute("SELECT * FROM segments WHERE capture_id=?",
+                                 (cid,)).fetchone()
+                if r is None:
+                    segment_added.append(cid)
+                elif r["content_hash"] == seg_digest:
+                    segment_reused.append(cid)
+                else:
+                    raise ApiError(
+                        409, "capture_conflict",
+                        f"采集编号 {cid} 已存在且内容不一致，整包拒绝",
+                        {"existing": _row_to_segment(r), "received": rec})
+
+            # 5) 锚点：与库中完全一致的记录为复用，其余为新增
+            affected_cycles = {(a["device_id"], a["cycle_id"])
+                               for a in anchors.values()}
+            db_anchor_pairs: dict[tuple[str, str], dict[int, int]] = {}
+            for key in affected_cycles:
+                db_anchor_pairs[key] = {
+                    r["local_ms"]: r["utc_ms"]
+                    for r in conn.execute(
+                        "SELECT local_ms, utc_ms FROM anchors "
+                        "WHERE device_id=? AND cycle_id=?", key).fetchall()}
+            anchor_added, anchor_reused = [], []
+            new_anchor_pairs: dict[tuple[str, str], list[tuple[int, int]]] = {}
+            for key, rec in anchors.items():
+                ckey = (rec["device_id"], rec["cycle_id"])
+                if db_anchor_pairs[ckey].get(rec["local_ms"]) == rec["utc_ms"]:
+                    anchor_reused.append(key)
+                else:
+                    anchor_added.append(key)
+                    new_anchor_pairs.setdefault(ckey, []).append(
+                        (rec["local_ms"], rec["utc_ms"]))
+
+            # 6) 封存保护：新增锚点/声段落入已封存周期 -> 整包拒绝
+            #    （与库中完全一致的记录只是复用，不构成变更）
+            touched = set(new_anchor_pairs)
+            touched |= {(segments[cid]["device_id"], segments[cid]["cycle_id"])
+                        for cid in segment_added}
+            sealed_targets = []
+            for dev, cyc in sorted(touched):
+                r = conn.execute(
+                    "SELECT sealed_at FROM cycles "
+                    "WHERE device_id=? AND cycle_id=?", (dev, cyc)).fetchone()
+                # 本包新登记的周期在库中尚无记录，必然未封存
+                if r is not None and r["sealed_at"] is not None:
+                    sealed_targets.append({"device_id": dev, "cycle_id": cyc,
+                                           "sealed_at": r["sealed_at"]})
+            if sealed_targets:
+                raise ApiError(
+                    409, "cycle_sealed",
+                    f"采集包试图向已封存周期写入新锚点/声段，"
+                    f"该周期内容已冻结，整包拒绝，不留下任何数据",
+                    {"cycles": sealed_targets})
+
+            # 7) 锚点最终序列校验：库中现有 + 包内新增合并后，本地时间唯一且
+            #    UTC 严格递增（与包内上传顺序无关，不因顺序误拒）
+            for ckey in sorted(new_anchor_pairs):
+                merged = sorted(list(db_anchor_pairs[ckey].items())
+                                + new_anchor_pairs[ckey])
+                for i in range(1, len(merged)):
+                    (pl, pu), (cl, cu) = merged[i - 1], merged[i]
+                    if cl == pl:
+                        raise ApiError(
+                            400, "anchors_not_increasing",
+                            f"设备 {ckey[0]} 周期 {ckey[1]} 合并后的锚点序列中"
+                            f"本地时间 local_ms={cl} 重复（与库中锚点冲突），"
+                            f"同一周期内锚点本地时间必须唯一，整包拒绝",
+                            {"device_id": ckey[0], "cycle_id": ckey[1],
+                             "local_ms": cl})
+                    if cu <= pu:
+                        raise ApiError(
+                            400, "anchors_not_increasing",
+                            f"设备 {ckey[0]} 周期 {ckey[1]} 合并后的锚点序列 "
+                            f"UTC 时间不严格递增：local_ms={pl} 的 utc_ms={pu}，"
+                            f"local_ms={cl} 的 utc_ms={cu}，整包拒绝",
+                            {"device_id": ckey[0], "cycle_id": ckey[1],
+                             "prev": {"local_ms": pl, "utc_ms": pu},
+                             "current": {"local_ms": cl, "utc_ms": cu}})
+
+            # 8) 全部校验通过：整包写入（新设备隐式创建 default 周期）
+            now = iso_now()
+            for dev in device_added:
+                conn.execute(
+                    "INSERT INTO devices(device_id, name, created_at) "
+                    "VALUES (?,?,?)", (dev, devices[dev]["name"], now))
+                conn.execute(
+                    "INSERT INTO cycles(device_id, cycle_id, note, created_at) "
+                    "VALUES (?,?,?,?)", (dev, DEFAULT_CYCLE_ID, None, now))
+            for dev, cyc in cycle_added:
+                conn.execute(
+                    "INSERT INTO cycles(device_id, cycle_id, note, created_at) "
+                    "VALUES (?,?,?,?)",
+                    (dev, cyc, cycles[(dev, cyc)]["note"], now))
+            for key in anchor_added:
+                rec = anchors[key]
+                conn.execute(
+                    "INSERT INTO anchors(device_id, cycle_id, local_ms, utc_ms, "
+                    "created_at) VALUES (?,?,?,?,?)",
+                    (rec["device_id"], rec["cycle_id"], rec["local_ms"],
+                     rec["utc_ms"], now))
+            for cid in segment_added:
+                rec = segments[cid]
+                conn.execute(
+                    """INSERT INTO segments(capture_id, device_id, cycle_id,
+                                            local_start_ms, local_end_ms,
+                                            note, content_hash, created_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (cid, rec["device_id"], rec["cycle_id"],
+                     rec["local_start_ms"], rec["local_end_ms"], rec["note"],
+                     seg_digests[cid], now))
+            result = {
+                "bundle_id": bundle_id,
+                "devices": {"added": len(device_added),
+                            "reused": len(device_reused)},
+                "cycles": {"added": len(cycle_added),
+                           "reused": len(cycle_reused)},
+                "anchors": {"added": len(anchor_added),
+                            "reused": len(anchor_reused)},
+                "segments": {"added": len(segment_added),
+                             "reused": len(segment_reused)},
+                "message": "采集包已整包导入：当前时间轴立即反映入库结果，"
+                           "已发布版本保持原快照",
+            }
+            # 记录首次结果：同编号同内容重传时原样返回，不重复写入
+            conn.execute(
+                "INSERT INTO bundles(bundle_id, content_hash, result, created_at) "
+                "VALUES (?,?,?,?)",
+                (bundle_id, digest,
+                 json.dumps(result, ensure_ascii=False, sort_keys=True), now))
+            return 201, {**result, "idempotent_replay": False}
 
 
 # ---------------------------------------------------------------- 当前时间轴

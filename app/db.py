@@ -17,6 +17,11 @@
 周期封存（seal，v1.2）：
 - cycles.sealed_at / seal_fingerprint 记录封存状态与封存时核对的内容指纹；
 - 旧库升级时自动补列，旧周期一律默认未封存。
+
+采集包（bundle，v1.8）：
+- bundles 表记录导入成功的包（内容指纹 + 首次结果 JSON），
+  同编号同内容重传返回首次结果、不重复写入；同编号异内容拒绝；
+- CREATE TABLE IF NOT EXISTS 随启动执行，旧库自动补表，无数据迁移。
 """
 from __future__ import annotations
 
@@ -95,6 +100,16 @@ CREATE TABLE IF NOT EXISTS version_segments (
     utc_end_ms      INTEGER,
     created_at      TEXT,
     PRIMARY KEY (version_no, capture_id)
+);
+
+-- 采集包（bundle，v1.8）：断网汇聚的多设备记录整包导入。
+-- 仅记录导入成功的包：内容指纹用于"同编号同内容重传返回首次结果"，
+-- result 为首次导入结果（JSON），重传时原样返回，不重复写入。
+CREATE TABLE IF NOT EXISTS bundles (
+    bundle_id    TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    result       TEXT NOT NULL,
+    created_at   TEXT NOT NULL
 );
 """
 

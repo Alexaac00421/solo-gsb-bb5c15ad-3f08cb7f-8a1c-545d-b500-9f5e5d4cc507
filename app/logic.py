@@ -304,6 +304,27 @@ def segment_content_hash(capture_id: str, device_id: str, cycle_id: str,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------- 采集包
+
+def bundle_content_hash(devices: list[dict], cycles: list[dict],
+                        anchors: list[dict], segments: list[dict]) -> str:
+    """采集包内容指纹：由包内四类记录集合生成（sha256），与记录顺序无关。
+
+    - 调用方须先完成字段校验、缺省值归一（cycle_id/note/name）与精确去重，
+      并按键排序后传入，因此"相同记录集合"无论上传顺序如何都得到同一指纹；
+    - 相同包编号重传时据此判定"内容是否相同"：指纹一致 -> 返回首次结果；
+      指纹不同 -> 编号复用冲突（bundle_conflict）。
+    """
+    canonical = json.dumps(
+        {"devices": sorted(devices, key=lambda r: r["device_id"]),
+         "cycles": sorted(cycles, key=lambda r: (r["device_id"], r["cycle_id"])),
+         "anchors": sorted(anchors, key=lambda r: (r["device_id"], r["cycle_id"],
+                                                   r["local_ms"])),
+         "segments": sorted(segments, key=lambda r: r["capture_id"])},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 # ---------------------------------------------------------------- 周期封存
 
 def cycle_fingerprint(device_id: str, cycle_id: str,

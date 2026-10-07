@@ -371,3 +371,93 @@ curl -s -X POST "$BASE/devices/RD1/cycles/default/coverage/rehearse" \
   -H 'Content-Type: application/json' \
   -d "{\"fingerprint\":\"$RFP2\",\"anchors\":[{\"local_ms\":0,\"utc_ms\":0}],
        \"start_ms\":0,\"end_ms\":1000,\"min_devices\":1}" | pp
+
+# ----------------------------------------------------------------------
+# 采集包导入（bundle，v1.8）：断网汇聚多设备记录，恢复后整包上传（原子、幂等）
+# ----------------------------------------------------------------------
+
+echo; echo "== 采集包导入：两台设备的设备/周期/锚点/声段整包上传（记录刻意乱序）=="
+echo "-- 包内顺序不限，可引用同包登记的设备与周期；省略 cycle_id 归入 default --"
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' -d '{
+  "bundle_id": "FIELD-001",
+  "segments": [
+    {"capture_id": "CAP-0202", "device_id": "BD2",
+     "local_start_ms": 3000, "local_end_ms": 9000},
+    {"capture_id": "CAP-0201", "device_id": "BD1", "cycle_id": "boot-2",
+     "local_start_ms": 5000, "local_end_ms": 20000, "note": "鸟鸣"}
+  ],
+  "anchors": [
+    {"device_id": "BD2", "local_ms": 60000, "utc_ms": 1700000057000},
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 61000, "utc_ms": 1700010060500},
+    {"device_id": "BD2", "local_ms": 0, "utc_ms": 1699999997000},
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 1000, "utc_ms": 1700010000000}
+  ],
+  "cycles": [
+    {"device_id": "BD1", "cycle_id": "boot-2", "note": "第二次开机"}
+  ],
+  "devices": [
+    {"device_id": "BD2", "name": "录音笔-乙"},
+    {"device_id": "BD1", "name": "录音笔-甲"}
+  ]
+}' | pp
+
+echo; echo "== 相同包编号 + 相同记录集合重传（乱序）-> 200 返回首次结果，不重复写入 =="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' -d '{
+  "bundle_id": "FIELD-001",
+  "devices": [{"device_id": "BD1", "name": "录音笔-甲"},
+              {"device_id": "BD2", "name": "录音笔-乙"}],
+  "cycles": [{"device_id": "BD1", "cycle_id": "boot-2", "note": "第二次开机"}],
+  "anchors": [
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 1000, "utc_ms": 1700010000000},
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 61000, "utc_ms": 1700010060500},
+    {"device_id": "BD2", "local_ms": 0, "utc_ms": 1699999997000},
+    {"device_id": "BD2", "local_ms": 60000, "utc_ms": 1700000057000}
+  ],
+  "segments": [
+    {"capture_id": "CAP-0201", "device_id": "BD1", "cycle_id": "boot-2",
+     "local_start_ms": 5000, "local_end_ms": 20000, "note": "鸟鸣"},
+    {"capture_id": "CAP-0202", "device_id": "BD2",
+     "local_start_ms": 3000, "local_end_ms": 9000}
+  ]
+}' | pp
+
+echo; echo "== 包编号复用但内容不同 -> 409 bundle_conflict =="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' \
+  -d '{"bundle_id":"FIELD-001","devices":[{"device_id":"BD9"}]}' | pp
+
+echo; echo "== 引用缺失 -> 404 device_not_found（整包拒绝，不留部分数据）=="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' \
+  -d '{"bundle_id":"FIELD-002",
+       "anchors":[{"device_id":"GHOST","local_ms":0,"utc_ms":1}]}' | pp
+
+echo; echo "== 锚点最终序列非法（与库中锚点本地时间重复但 UTC 不同）-> 400 =="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' \
+  -d '{"bundle_id":"FIELD-003",
+       "anchors":[{"device_id":"BD1","cycle_id":"boot-2",
+                   "local_ms":1000,"utc_ms":1799999999999}]}' | pp
+
+echo; echo "== 与库中记录混合：完全一致的复用、其余新增，数量分别统计 =="
+curl -s -X POST "$BASE/bundles" -H 'Content-Type: application/json' -d '{
+  "bundle_id": "FIELD-004",
+  "devices": [{"device_id": "BD1", "name": "录音笔-甲"}],
+  "anchors": [
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 1000, "utc_ms": 1700010000000},
+    {"device_id": "BD1", "cycle_id": "boot-2",
+     "local_ms": 121000, "utc_ms": 1700010121000}
+  ],
+  "segments": [
+    {"capture_id": "CAP-0201", "device_id": "BD1", "cycle_id": "boot-2",
+     "local_start_ms": 5000, "local_end_ms": 20000, "note": "鸟鸣"},
+    {"capture_id": "CAP-0203", "device_id": "BD1", "cycle_id": "boot-2",
+     "local_start_ms": 70000, "local_end_ms": 80000}
+  ]
+}' | pp
+
+echo; echo "== 发布版本：反映采集包入库结果（已发布版本保持原快照）=="
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"note":"采集包入库"}' | pp
